@@ -1,0 +1,51 @@
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  selftest:
+    name: 自测（Windows）
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 语法检查
+        shell: pwsh
+        run: |
+          $failed = $false
+          foreach ($file in @('relocator.ps1', 'tests/selftest.ps1')) {
+            $errors = $null
+            [System.Management.Automation.Language.Parser]::ParseFile(
+              (Join-Path $PWD $file), [ref]$null, [ref]$errors) | Out-Null
+            if ($errors) {
+              $errors | ForEach-Object { Write-Host "::error file=$file,line=$($_.Extent.StartLineNumber)::$($_.Message)" }
+              $failed = $true
+            } else {
+              Write-Host "$file 语法 OK"
+            }
+          }
+          if ($failed) { exit 1 }
+
+      - name: 真实搬移与撤销
+        shell: pwsh
+        run: ./tests/selftest.ps1
+
+      - name: 检查文档里的相对链接
+        shell: pwsh
+        run: |
+          $missing = 0
+          $content = Get-Content README.md -Raw
+          foreach ($m in [regex]::Matches($content, '\]\((?<url>[^)#]+)\)')) {
+            $url = $m.Groups['url'].Value
+            if ($url -match '^https?://') { continue }
+            if (-not (Test-Path $url)) {
+              Write-Host "::error::README 里的链接指向不存在的文件：$url"
+              $missing++
+            }
+          }
+          if ($missing) { exit 1 }
+          Write-Host '链接全部有效'
