@@ -1,232 +1,201 @@
 # win-cache-relocator
 
-> 把 C 盘上**会一直长回来**的缓存目录搬到其他盘，原路径留一个目录联接（Junction）。
-> 软件照常访问原来的路径，字节落在别的盘，新产生的数据也不再回 C 盘。
->
-> A zero-dependency PowerShell tool that relocates cache directories off the system
-> drive with NTFS junctions — verifies every byte before deleting, and can undo everything.
+把 C 盘上**会一直长回来**的缓存搬到其他盘，原路径留一个重定向点。
+程序照常访问原来的路径，字节落在别的盘，新产生的数据也不再回 C 盘。
+
+零依赖，只用 Windows 自带的 PowerShell 5.1、robocopy 和 Restart Manager。
+
+```
+.\relocator.cmd          交互菜单（推荐给不熟悉命令行的）
+.\relocator.ps1 scan     先看看哪些目录占地方
+```
 
 ---
 
 ## 为什么不是「清理」
 
-清理只能把问题推迟。真实机器的实测（13 天）：
+清理只能把问题推迟。同一台机器上间隔 13 天的对比：
 
 | 处理方式 | 清理时 | 13 天后 |
 |---|---|---|
 | 只删除 `%LOCALAPPDATA%\Temp` | 0 GB | **10.94 GB 又回到 C 盘** |
-| 用联接搬到 D 盘 | 3.69 GB | 9.45 GB，**其中 5.76 GB 全在 D 盘** |
+| 用重定向搬走 | 3.69 GB | 9.45 GB，**其中 5.76 GB 全在 D 盘** |
 
-也就是说：删除是消耗品，大约两周就失效一次；联接是改道，程序仍然访问原路径，只是字节不再落在 C 盘。
+删除是消耗品，两周失效一次；重定向是改道。
 
-（这组数字来自 [drivekeeper](https://github.com/linad3d/drivekeeper) 的 README，不是本项目测的。）
-
----
-
-## 它做四件事
-
-```
-scan    量一量哪些目录值得搬，按大小排序，标注安全等级
-locks   查清楚是谁锁着——包括你在任务管理器里看不到的系统服务
-move    复制 → 逐字节校验 → 建联接 → 删旧目录；任何一步失败自动还原
-undo    按台账一键搬回去
-```
-
-### 跟同类工具的三个区别
-
-**1. 占用检测能看见系统服务。**
-用的是 Windows Restart Manager（同样是被 Office/安装程序用来查"谁占着文件"的那套 API），
-所以能报出 `codex-windows-sandbox-service` 这类以 LocalSystem 身份运行的服务——
-普通 `Stop-Process` 杀不掉它，任务管理器里也未必看得见，但文件确实是它锁着的。
-
-**2. 复制时不跟随联接（`/XJ`）。**
-一个目录里如果已经有子目录被做成了联接，普通复制会**顺着联接把目标盘的数据再抄一遍**，
-凭空多出几 GB。本项目踩过这个坑（一次多出 7 GB），所以复制固定带 `/XJ`，
-统计体积时也跳过所有 reparse point。
-
-**3. 知道有些软件不接受联接作为数据目录。**
-比如 DSH（DeepSeek Harness）启动时会校验数据目录"必须是真实目录"，见到联接直接报
-`Expected a real directory`。遇到这类目录，工具会自动改用 `move-only` 模式：
-只搬数据、不建联接，然后告诉你该改哪个环境变量或配置文件。
+> 这组数字来自 [drivekeeper](https://github.com/linad3d/drivekeeper) 的实测记录，不是本项目测的。
+> 本站自己的验证只有一条：`.dsh` 目录搬走后，DSH 重启、日志恢复写入、新数据全部落在 D 盘。
 
 ---
 
-## 快速开始
+## 三种重定向机制
 
-```powershell
-# 0. 下载后解压，在解压目录里打开 PowerShell
-#    （或者直接用 relocator.cmd，它帮你绕过执行策略）
+按可靠性排序，能用前面的就不要用后面的：
 
-# 1. 看看能搬什么
-.\relocator.ps1 scan
+| 优先级 | 机制 | 适用 | 代价 |
+|---|---|---|---|
+| 1 | **应用自己的设置** | 应用提供「数据目录」选项 | 需要手动点一下 |
+| 2 | **环境变量** | 工具链、Agent（`CODEX_HOME`、`HF_HOME`、`NUGET_PACKAGES`…） | 只对该变量生效，需重开终端 |
+| 3 | **NTFS 目录联接** | 其余所有情况（通用兜底） | 个别应用会拒绝；备份工具可能不认 |
 
-# 2. 查一个目录是谁锁着
-.\relocator.ps1 locks -Source "$env:LOCALAPPDATA\Kingsoft"
+本工具的 `env` 子命令做第 2 种，`move` 默认做第 3 种，遇到已知拒绝联接的应用会自动改用第 2 种。
 
-# 3. 先预演，不动文件
-.\relocator.ps1 move -Name Kingsoft -Target D:\Moved -DryRun
+**为什么不能一律用联接**：DSH（DeepSeek Harness）启动时校验数据目录「必须是真实目录」，
+见到联接直接报 `Expected a real directory`。这类应用只能靠环境变量或它自己的设置。
+反过来，环境变量也不能滥用——同一软件的多个版本共用一个变量时，两份数据会被指到同一个目录互相踩。
 
-# 4. 正式搬（会问一次确认）
-.\relocator.ps1 move -Name Kingsoft -Target D:\Moved
+---
 
-# 5. 看搬过哪些
-.\relocator.ps1 list
+## 命令
 
-# 6. 后悔了，搬回去
-.\relocator.ps1 undo -Name Kingsoft
+| 命令 | 作用 |
+|---|---|
+| `scan` | 量体积、分类（只读）。加 `-Json` 输出机器可读格式 |
+| `locks -Source <路径>` | 查占用，**包含系统服务** |
+| `move -Name <名字> -Target <根目录>` | 搬移。加 `-DryRun` 只预演 |
+| `move -Source <绝对路径> …` | 搬任意目录（不在库里的需加 `-AllowUnknown`） |
+| `resume` | 继续/收尾一次未完成的搬移 |
+| `undo -Name <名字>` / `-All` | 撤销 |
+| `repair` | 重建断掉的联接，不动数据 |
+| `doctor` | 体检：断链、目标丢失、未完成的搬移 |
+| `env -Target <根目录>` | 设置工具链缓存环境变量（改前备份旧值） |
+| `undo-env` | 还原上一次 `env` 的修改 |
+| `list` | 已搬移清单 |
+
+常用选项：`-DryRun` 预演 · `-Yes` 跳过确认 · `-Hash` 逐文件 SHA-256 · `-Mode` 强制指定机制。
+
+---
+
+## 搬移是一个状态机
+
+不是「复制、删掉、建链接」三步糊在一起，而是每步都落盘：
+
+```
+pending → copying → verified → renamed → linked → done
+              ↘ 任一步失败：状态留在 pending.json
 ```
 
-`scan` 的输出长这样：
+失败的下一步不是猜，是运行 `resume`：
 
 ```
-目录                                 大小      等级      说明
-.codex                            5.79 GB   close     Codex 数据；有系统服务时需先停服务
-.dsh                              5.58 GB   close     DeepSeek Harness 数据
-Kingsoft                          1.49 GB   close     WPS 缓存
-.cache                            2.96 GB   safe      Python/uv/HF 等通用缓存
+=== 未完成的搬移 ===
+  源:   C:\Users\你\AppData\Local\Something
+  目标: D:\Moved\AppData\Local\Something
+  停在: link-failed-unrestored
+  快照: C:\Users\你\AppData\Local\Something.moved-20261121-160342-a1b2c3
 ```
 
-- `safe` —— 纯缓存，删了也能重建，随时可搬
-- `close` —— 应用数据，**先关掉对应软件**再搬
-- `caution` —— 能搬但建议用环境变量代替（比如 Temp）
+它会告诉你三个路径各自现在是什么状态、原始数据在哪、有哪两条路可选。
+
+---
+
+## 校验到底做了什么
+
+说清楚，因为这里是同类工具最容易夸大的地方：
+
+| 阶段 | 检查内容 |
+|---|---|
+| 复制后 | **逐个文件比对**相对路径、大小；再比总文件数、总字节数 |
+| 建联接后 | 经联接再读一遍，比对文件数与字节数 |
+| `-Hash` | 额外对每个文件算 SHA-256 并比对 |
+
+**默认不校验文件内容**——只保证「结构一致、大小一致」。位翻转这类损坏检测不出来，
+要更严就加 `-Hash`（慢，大目录可能几十分钟）。
+
+复制用 `robocopy /E /XJ /COPY:DAT /DCOPY:DAT`：
+- `/XJ` 不跟随源目录里已有的联接，否则会把别处的数据重复复制一遍（实测一次多出 7 GB）
+- `/DCOPY:DAT` 保留目录时间戳
+- 退出码 `< 8` 才算成功（robocopy 是位掩码，`1` 表示「有文件被复制」不是失败）
 
 ---
 
 ## 安全模型
 
-**受保护清单**（一律拒绝搬移，防止手滑搬掉系统目录）：
+**用户数据永远不搬。** 这一条是硬编码的，`scan` 不把它们计入「可搬」，`move` 直接拒绝：
 
 ```
-%LOCALAPPDATA%\Packages          %LOCALAPPDATA%\Microsoft
-%APPDATA%\Microsoft              %LOCALAPPDATA%\Programs
-C:\Windows\*                     C:\Program Files*
-C:\ProgramData\*                 任何 .git 目录
-盘根目录、用户目录本身、AppData 本身
+Documents  Desktop  Downloads  Pictures  Music  Videos  Saved Games
+OneDrive  Dropbox  Google Drive  Contacts  Favorites  Links  Public
 ```
 
-**搬移的五步**，任何一步失败都还原：
-
-| 步骤 | 做什么 | 失败时 |
-|---|---|---|
-| 1 | `robocopy /E /XJ` 复制 | 中止，源目录未动 |
-| 2 | 比对**文件数 + 总字节数** | 中止，源目录未动（目标目录保留给你查） |
-| 3 | 源目录改名为 `.moving` | 还原名字 |
-| 4 | 建联接，**经联接再读一遍**校验 | 删联接、还原名字 |
-| 5 | 删除 `.moving` | 残留会提示路径，可手动删 |
-
-**台账**：每次搬移记录到 `%LOCALAPPDATA%\WinCacheRelocator\ledger.json`，
-`undo` 按它还原。台账丢了也不影响数据——`cmd /c rmdir <原路径>` 删掉联接，
-再把 D 盘目录移回去即可。
-
----
-
-## 命令参考
-
-| 命令 | 作用 |
-|---|---|
-| `scan` | 扫描用户目录 / AppData\Local / AppData\Roaming，列出 ≥50 MB 的目录 |
-| `locks -Source <路径>` | 列出占用该目录的进程与服务 |
-| `move -Name <名字> -Target <根目录>` | 搬移（按名字在用户目录与 AppData 下查找） |
-| `move -Source <绝对路径> -Target <根目录>` | 搬移任意目录 |
-| `undo -Name <名字>` / `undo -All` | 按台账还原 |
-| `list` | 列出已搬移的项 |
-| `env -Target <根目录>` | 设置工具链缓存环境变量（见下） |
-
-**选项**：
-
-| 选项 | 说明 |
-|---|---|
-| `-DryRun` | 只检查、只打印计划，不动任何文件 |
-| `-Yes` | 跳过确认提示（脚本化时用） |
-| `-Mode move-only` | 只搬数据、不建联接（给拒绝联接的软件用） |
-| `-Force` | 占用检查不通过也继续（**不建议**） |
-
-### `env` 会设置什么
-
-把工具链的缓存指到新盘，这样连搬都不用搬——新数据直接落过去：
+**系统与安装目录也不搬：**
 
 ```
-TEMP / TMP                pip        UV_CACHE_DIR     npm_config_cache
-YARN_CACHE_FOLDER         GRADLE_USER_HOME            NUGET_PACKAGES
-PLAYWRIGHT_BROWSERS_PATH  HF_HOME    TORCH_HOME       CARGO_HOME  RUSTUP_HOME
+C:\Windows  C:\Program Files  C:\Program Files (x86)  C:\ProgramData
+%LOCALAPPDATA%\Packages  %LOCALAPPDATA%\Microsoft  %LOCALAPPDATA%\Programs
+%APPDATA%\Microsoft  %USERPROFILE%\AppData 及以下各级
+任何 .git / .ssh / .gnupg
 ```
 
-设的是**用户级**环境变量，重新打开终端生效。想撤回就在「系统属性 → 环境变量」里改回去。
+判断基于**归一化后的绝对路径**逐段比较，不用结尾正则——`C:\Users\你\AppData\`（带尾随反斜杠）
+这种写法绕不过去。
+
+**未收录的目录默认不搬。** 目录库只收录已知的缓存与应用数据；不认识的目录必须显式 `-AllowUnknown`。
+
+**其他护栏：**
+
+- 源和目标在同一个盘 → 拒绝（省不了空间，还多一份风险），除非 `-AllowSameVolume`
+- 目标在源目录内部（或反之）→ 拒绝，否则 robocopy 会自我复制到路径爆炸
+- 目标卷不是 NTFS → 拒绝（exFAT 保不住属性和 ACL）
+- 目标剩余空间不足 → 拒绝，预留 5% + 64 MB
+- 发现上次留下的快照目录 → **拒绝搬移并报出路径**，绝不自动删除
+- 所有路径判断都用 `-LiteralPath`，`cache[1]` 这种名字不会被当成通配符
 
 ---
 
 ## 已知限制
 
-**1. 拒绝联接的软件。** 目前已知：
+**1. 个别应用拒绝联接。** 目前确认：DSH。表现为启动报错或读不到数据，
+改用 `-Mode env` 或 `-Mode move-only`。发现新的欢迎提 Issue。
 
-| 软件 | 表现 | 正确做法 |
-|---|---|---|
-| DSH（DeepSeek Harness） | 启动报 `Expected a real directory` | 用 `-Mode move-only`，再设 `DSH_HOME` 环境变量指向新目录 |
+**2. 跨卷撤销要完整复制一遍。** 数据在 D 盘、要搬回 C 盘，本质是一次完整复制，
+没有「秒回」的办法。`undo` 会先复制到临时名、校验、再切换，所以中途失败不会留下残缺目录。
 
-其他软件如果启动后读不到数据、报"数据目录无效"，多半也是这个问题——
-改用 `move-only` 并在它的设置里指定新位置。发现新的请提 Issue。
+**3. `scan` 在文件很多的机器上要跑一两分钟。** 它要真实遍历每个候选目录，
+没有便宜的估算办法（Windows 不提供「目录总大小」的系统接口）。
 
-**2. Docker / WSL 不要用本工具。** 它们的虚拟磁盘要走官方导出/导入流程。
+**4. 嵌套联接不会被复制。** 源目录里如果有子目录是联接，`/XJ` 会跳过它，
+搬完后那个链接就没了。工具会提前列出来并警告，但需要你自己决定怎么处理。
 
-**3. `AppData\Local\Packages` 不碰。** 系统应用数据，搬了会出各种怪问题。
+**5. 硬链接会被当成独立文件。** 统计和复制都按普通文件处理，目标会多占一份空间。
 
-**4. 联接只在本机有效。** 备份工具、同步盘、虚拟机共享目录可能不认联接。
-如果你用 OneDrive 同步桌面/文档，别把这些目录搬走。
+**6. 只对当前用户有效。** 系统级缓存（`C:\Windows\Temp`、`C:\ProgramData`）不碰。
 
-**5. 需要 Windows 10/11。** 依赖 NTFS 联接与 Restart Manager。
+**7. 不做 GUI。** 一个 1500 行的明文脚本，你可以从头读到尾。
 
 ---
 
-## 常见问题
+## 和同类工具的关系
 
-**Q：搬完软件打不开了怎么办？**
+这个领域不算空，动手前查过一圈，明确吸收了几家的经验：
 
-先 `undo` 搬回去，确认软件正常，再想想是不是"拒绝联接"那一类（见上）。
-数据不会丢——`undo` 只是删联接、把目录移回原位。
+| 项目 | 借鉴了什么 |
+|---|---|
+| [agent-cache-migrator](https://github.com/cv-superding/agent-cache-migrator) | `RmRegisterResources` 只接受文件路径、混入目录会让整个注册失败；展开成文件要设上限并跳过联接；用「最新修改时间」辅助判断应用是否还在写 |
+| [drivekeeper](https://github.com/linad3d/drivekeeper) | 机制优先级「应用设置 > 环境变量 > 联接」；复制后独立重数，不信复制工具自己的汇总；逐子目录判断而不是整个应用一刀切 |
+| [AppDataMover](https://github.com/zennos0609-dotcom/AppDataMover) | Restart Manager 做精确占用检测；迁移建议分级 |
+| [FreeMove](https://github.com/imDema/FreeMove) | 更早的通用「搬目录 + 建链接」实现，GUI 友好 |
 
-**Q：`locks` 说被占用，但我找不到那个进程。**
-
-看输出里有没有 `[服务: xxx]`。那是系统服务，需要在**管理员** PowerShell 里
-`Stop-Service xxx -Force`；有些服务停了会自动重启，那就先 `Set-Service xxx -StartupType Manual`。
-
-**Q：能搬程序安装目录吗？**
-
-不能，也不该。本工具只搬数据目录。装到 D 盘请用软件自己的安装程序。
-
-**Q：搬完之后 C 盘还会长吗？**
-
-会，但慢得多。剩下的增长来自：仍在 C 盘的小缓存、系统更新、以及硬编码了 C 盘路径的软件。
-定期跑一次 `scan` 就能看到新的"大头"。
-
-**Q：`relocator.ps1` 双击没反应 / 报"禁止运行脚本"。**
-
-用同目录的 `relocator.cmd`，它带了 `-ExecutionPolicy Bypass`。
-或者一次性放开：`Set-ExecutionPolicy -Scope CurrentUser RemoteSigned`。
-
-**Q：为什么不做成 exe？**
-
-零依赖、可审计。你可以打开这个 `.ps1` 从头读到尾，确认它没有偷偷删你的东西——
-一个 700 行的明文脚本比一个 20 MB 的 exe 更值得信任。
+本工具的差异点：**搬移过程是可恢复的状态机**，以及**把「用户数据永不搬」写成硬约束**。
+同类工具多数是「选中就搬」，对普通用户来说少了这一层。
 
 ---
 
 ## 开发
 
 ```powershell
-# 自测（在临时目录里造数据 -> 搬 -> 校验 -> 撤销）
+# 自测：在临时目录里造数据、跑真实搬移、逐项断言
+# 台账隔离到临时目录，不会碰你的真实记录
 .\tests\selftest.ps1
-
-# 语法检查
-powershell -NoProfile -Command "[void][System.Management.Automation.Language.Parser]::ParseFile('$PWD\relocator.ps1',[ref]$null,[ref]$e); if($e){$e;exit 1}"
 ```
 
-代码结构：`relocator.ps1` 单文件，按 `常量 → 基础工具 → 台账 → 扫描 → 占用检测 → 搬移 → 撤销 → 环境变量` 分段。
-占用检测的 P/Invoke 在 `Initialize-RestartManager` 里，是唯一一块 C# 内嵌代码。
+覆盖：正常搬移与撤销、move-only 的撤销、尾随反斜杠绕过、用户数据保护、
+未收录目录拒绝、目标在源内部、预存快照不被删、方括号路径、子联接不复制、退出码、台账唯一 Id。
+
+CI 在 GitHub Actions 的 `windows-latest` 上跑同一套（`.github/workflows/test.yml`）。
 
 ---
 
 ## 许可
 
 [AGPL-3.0-only](LICENSE)。
-
-用出问题欢迎提 Issue，附上 `scan` 输出和 `locks` 结果，一般能直接定位。
