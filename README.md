@@ -52,7 +52,8 @@
 |---|---|
 | `scan` | 量体积、分类（只读）。加 `-Json` 输出机器可读格式 |
 | `locks -Source <路径>` | 查占用，**包含系统服务** |
-| `move -Name <名字> -Target <根目录>` | 搬移。加 `-DryRun` 只预演 |
+| `move -Name <名字> [-Target <根目录>]` | 搬移。加 `-DryRun` 只预演；不指定目标时自动选剩余空间最大的非系统盘 |
+| `move -AllSafe` | 批量搬走所有已收录的安全缓存（不需要逐个判断） |
 | `move -Source <绝对路径> …` | 搬任意目录（不在库里的需加 `-AllowUnknown`） |
 | `resume` | 继续/收尾一次未完成的搬移 |
 | `undo -Name <名字>` / `-All` | 撤销 |
@@ -66,6 +67,33 @@
 
 ---
 
+## 不知道搬哪个？用批量模式
+
+`scan` 会列出几十个目录，逐个判断对普通人太难。收录库已经替你做了一次判断，
+`-AllSafe` 直接把「已收录 + 分类为安全」的一批搬走：
+
+```
+> .\relocator.ps1 move -AllSafe -DryRun
+
+=== 批量搬移 8 个已收录的安全缓存 ===
+  @opencodedesktop-updater      510 MB
+  qoder-cn-updater              458 MB
+  dsh-desktop-next-updater      319 MB
+  agents-anywhere-desktop-workb… 295 MB
+  qoder-updater                 256 MB
+  mojie-updater                 139 MB
+  blockbench-updater            111 MB
+  uv                            347 B
+
+  合计 2.04 GB
+  注意 目标未指定，自动选择 D:\Moved
+```
+
+**只搬 `safe` 这一档**。`close`（应用数据）和 `caution`（临时文件）都不会被批量带走，
+因为它们需要你先关掉对应软件，或者本来就该用环境变量处理。
+
+批量模式仍然逐个走完整流程：每个目录都有独立的状态机、独立校验、独立台账。
+中途某个失败不会影响别的，最后汇总「成功几个、失败几个」。
 ## 搬移是一个状态机
 
 不是「复制、删掉、建链接」三步糊在一起，而是每步都落盘：
@@ -191,6 +219,8 @@ C:\Windows  C:\Program Files  C:\Program Files (x86)  C:\ProgramData
 
 覆盖：正常搬移与撤销、move-only 的撤销、尾随反斜杠绕过、用户数据保护、
 未收录目录拒绝、目标在源内部、预存快照不被删、方括号路径、子联接不复制、退出码、台账唯一 Id。
+
+`move -AllSafe -DryRun` 可以拿来验证分类是否符合预期，它不会动任何文件。
 
 CI 在 GitHub Actions 的 `windows-latest` 上跑同一套（`.github/workflows/test.yml`）。
 

@@ -39,13 +39,14 @@ param(
     [switch]$Force,
     [switch]$Hash,
     [switch]$Json,
+    [switch]$AllSafe,
     [switch]$AllowSameVolume,
     [switch]$AllowUnknown,
     [ValidateSet('auto', 'junction', 'env', 'move-only')][string]$Mode = 'auto'
 )
 
 $ErrorActionPreference = 'Stop'
-$script:Version = '1.1.0'
+$script:Version = '1.2.0'
 $script:StateRoot = if ($StateDir) { $StateDir } else { Join-Path $env:LOCALAPPDATA 'WinCacheRelocator' }
 $script:LedgerPath = Join-Path $script:StateRoot 'ledger.json'
 $script:PendingPath = Join-Path $script:StateRoot 'pending.json'
@@ -801,7 +802,8 @@ function Resolve-MoveTarget {
 }
 
 function Invoke-Move {
-    param([string]$ExplicitSource, [switch]$Resuming)
+    param([string]$ExplicitSource, [switch]$Resuming, [switch]$batch)
+    if ($batch) { $Yes = $true }
 
     if (-not $Resuming) {
         if (Show-PendingWarning) {
@@ -842,8 +844,11 @@ function Invoke-Move {
         if (-not (Test-Path -LiteralPath $src)) { Write-Bad "子目录不存在: $src"; Set-Failure; return }
     }
 
-    if (-not $Target) {
-        if (-not $Resuming) { Write-Bad '请用 -Target 指定目标根目录，例如 -Target D:\Moved'; Set-Failure; return }
+    if (-not $Target -and -not $Resuming) {
+        $auto = Get-DefaultTargetRoot
+        if (-not $auto) { Write-Bad '没有可用的非系统盘，请用 -Target 指定'; Set-Failure; return }
+        $Target = $auto
+        Write-No "没有指定 -Target，自动选择 $Target"
     }
 
     Write-H "搬移 $Name"
@@ -1115,6 +1120,70 @@ function Invoke-Move {
     Write-Host ''
     Write-Ok "搬走 $(Format-Size $man.Bytes)"
     Write-Dim "启动 $Name 验证能正常用；有问题执行：.\relocator.ps1 undo -Name `"$Name`""
+}
+
+function Get-DefaultTargetRoot {
+    <#
+      没指定 -Target 时，挑剩余空间最大的非系统盘（必须是本地固定 NTFS）。
+    #>
+    $sysRoot = (Get-VolumeInfo $env:USERPROFILE).Root
+    $best = $null
+    foreach ($d in [System.IO.DriveInfo]::GetDrives()) {
+        if (-not $d.IsReady) { continue }
+        if ($d.DriveType -ne 'Fixed') { continue }
+        if ($d.DriveFormat -ne 'NTFS') { continue }
+        if ($d.RootDirectory.FullName -eq $sysRoot) { continue }
+        if ($d.AvailableFreeSpace -lt 5GB) { continue }
+        if (-not $best -or $d.AvailableFreeSpace -gt $best.AvailableFreeSpace) { $best = $d }
+    }
+    if (-not $best) { return $null }
+    return (Join-Path $best.RootDirectory.FullName 'Moved')
+}
+
+function Invoke-MoveAllSafe {
+    <#
+      把所有"已收录且分类为 safe"的目录按体积从大到小搬走。
+      这是最省心的入口：不需要用户逐个判断，因为收录库已经判过了。
+    #>
+    $cands = @(Get-CandidateDirs | Where-Object { $_.Class -eq 'safe' -and $_.Kind -eq 'real' })
+    if ($cands.Count -eq 0) { Write-No '没有可批量搬的已收录缓存目录'; return }
+
+    $rows = @()
+    foreach ($c in $cands) {
+        $m = Get-TreeManifest -Path $c.Path
+        if ($m.Files -eq 0) { continue }
+        $rows += [pscustomobject]@{ Name = $c.Name; Path = $c.Path; Bytes = $m.Bytes; Files = $m.Files }
+    }
+    $rows = @($rows | Sort-Object Bytes -Descending)
+    if ($rows.Count -eq 0) { Write-No '没有可搬的'; return }
+
+    Write-H "批量搬移 $($rows.Count) 个已收录的安全缓存"
+    foreach ($r in $rows) { Write-Host ('  {0}{1}' -f (Format-Cell $r.Name 30), (Format-Size $r.Bytes)) }
+    $total = ($rows | Measure-Object Bytes -Sum).Sum
+    Write-Host ''
+    Write-Host ("  合计 $(Format-Size $total)") -ForegroundColor Cyan
+
+    if (-not $Target) {
+        $auto = Get-DefaultTargetRoot
+        if ($auto) { $Target = $auto; Write-No "目标未指定，自动选择 $Target" }
+        else { Write-Bad '没有可用的非系统盘，请用 -Target 指定'; Set-Failure; return }
+    }
+    if ($DryRun) { Write-Host ''; Write-No 'DryRun：以上都会被搬走，现在没动任何文件'; return }
+    if (-not $Yes) {
+        Write-Host ''
+        $a = Read-Host "  确认搬走这 $($rows.Count) 个目录？(y/N)"
+        if ($a -notmatch '^[yY]') { Write-No '已取消'; return }
+    }
+
+    $ok = 0; $failed = 0
+    foreach ($r in $rows) {
+        Write-Host ''
+        Invoke-Move -ExplicitSource $r.Path -Target $Target -batch
+        if ($script:Failures -gt 0) { $failed++; $script:Failures = 0 } else { $ok++ }
+    }
+    Write-Host ''
+    if ($failed -eq 0) { Write-Ok "全部完成：$ok 个目录" }
+    else { Write-No "成功 $ok 个，失败 $failed 个（原因见上）"; Set-Failure }
 }
 
 function Show-EnvHint {
@@ -1483,8 +1552,10 @@ win-cache-relocator v$($script:Version)
 命令
   scan                        量体积、分类（只读）
   locks  -Source <路径>        查占用，含系统服务
-  move   -Name <名字> -Target <根目录>
-                              搬移；加 -DryRun 只预演
+  move   -Name <名字> [-Target <根目录>]
+                              搬移某个目录；加 -DryRun 只预演
+  move   -AllSafe [-Target <根目录>]
+                              批量搬走所有已收录的安全缓存
   resume                      继续/收尾一次未完成的搬移
   undo   -Name <名字> | -All   撤销
   repair                      重建断掉的联接（不动数据）
@@ -1530,7 +1601,7 @@ try {
     switch ($Command.ToLower()) {
         'scan' { Invoke-Scan }
         'locks' { Invoke-Locks }
-        'move' { Invoke-Move -ExplicitSource $Source }
+        'move' { if ($AllSafe) { Invoke-MoveAllSafe } else { Invoke-Move -ExplicitSource $Source } }
         'resume' { Invoke-Resume }
         'undo' { Invoke-Undo -AllFlag:$All }
         'repair' { Invoke-Repair }
